@@ -126,7 +126,9 @@ jobs:
           text='ma mà mả mã má'
           printf '%s' "$text" > in.txt
           mkdir -p smoke
-          "$exe" --version | tee smoke/version.txt
+          # --version with no --path segfaulted on the runner (no registry data path); informational.
+          "$exe" --path "$data" --version > smoke/version.txt 2>&1 || echo "--version exit $?" >> smoke/version.txt
+          cat smoke/version.txt
           # Text as an argument (how the app passes it today) and as a UTF-8 file.
           "$exe" --path "$data" -q -x --ipa -v vi "$text" > smoke/ipa-argv-x.txt || true
           "$exe" --path "$data" -v vi --ipa -q -- "$text" > smoke/ipa-argv.txt || true
@@ -210,6 +212,7 @@ jobs:
           Get-ChildItem $root | ForEach-Object Name
           "CUDA_PATH=$root" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "$root\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          $global:LASTEXITCODE = 0   # robocopy's 1 means "files copied"
 
       # Backends as DLLs (upstream buildall.cmd): ggml_backend_load_all() loads ggml-cuda.dll
       # only when the CUDA runtime DLLs resolve, so a machine without them still runs on CPU.
