@@ -80,25 +80,10 @@ jobs:
           curl -sSfL -o "out/LICENSE-espeak-ng" \
             "https://raw.githubusercontent.com/espeak-ng/espeak-ng/${ESPEAK_REV}/COPYING"
 
-          # Is the MSI's data dir the same content as the macOS archive?
+          # No Windows data archive: the app uses the release dub-2026.10.10 espeak-ng-data.tar
+          # on every platform. Fetched here only for the smoke.
           curl -sSfL -o mac.tar "$MAC_DATA_URL"
           echo "${MAC_DATA_SHA256}  mac.tar" | sha256sum -c -
-          mkdir -p mac && tar -C mac -xf mac.tar
-          win="$root/espeak-ng-data"
-          (cd mac && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum) > mac.sums
-          (cd "$win" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum) > win.sums
-          echo "mac files: $(wc -l < mac.sums), windows files: $(wc -l < win.sums)"
-          if diff mac.sums win.sums > data.diff; then
-            echo "DATA: the MSI's espeak-ng-data is byte-identical, file for file, to the macOS archive" | tee -a "$GITHUB_STEP_SUMMARY"
-            cp mac.tar out/espeak-ng-data.tar
-          else
-            echo "DATA: the MSI's espeak-ng-data DIFFERS from the macOS archive ($(grep -c '^[<>]' data.diff) lines differ)" | tee -a "$GITHUB_STEP_SUMMARY"
-            head -40 data.diff
-            (cd "$win" && find . -type f | LC_ALL=C sort | sed 's|^\./||') > files
-            tar -C "$win" --format=ustar --owner=0 --group=0 --numeric-owner \
-              --mtime='2000-01-01 00:00:00Z' --mode='u+rw,go+r' \
-              -cf out/espeak-ng-data.tar -T files
-          fi
           ls -l out
 
           # espeak-ng.exe and libespeak-ng.dll link the dynamic MSVC runtime, which a clean
@@ -109,40 +94,19 @@ jobs:
           for d in msvcp140 vcruntime140 vcruntime140_1; do cp "$crt/$d.dll" "vcrt/$d-$TRIPLE.dll"; done
           ls -l vcrt
 
-      - name: Smoke - the shipped files phonemise Vietnamese
+      - name: Smoke - the shipped exe over the pinned data phonemises Vietnamese
         shell: bash
         run: |
           set -euo pipefail
           probe="$(cygpath -u "$RUNNER_TEMP")/probe"
-          mkdir -p "$probe/bin" "$probe/espeak-ng-data" "$probe-mac/espeak-ng-data"
-          tar -C "$probe/espeak-ng-data" -xf out/espeak-ng-data.tar
-          tar -C "$probe-mac/espeak-ng-data" -xf mac.tar
+          mkdir -p "$probe/bin" "$probe/espeak-ng-data"
+          tar -C "$probe/espeak-ng-data" -xf mac.tar
           for f in out/*-"$TRIPLE".* vcrt/*-"$TRIPLE".*; do
             b="$(basename "$f")"; cp "$f" "$probe/bin/${b/-$TRIPLE/}"
           done
-          ls -l "$probe/bin"
-          data="$(cygpath -w "$probe")"
-          exe="$probe/bin/espeak-ng.exe"
-          text='ma mà mả mã má'
-          printf '%s' "$text" > in.txt
-          mkdir -p smoke
-          # --version with no --path segfaulted on the runner (no registry data path); informational.
-          "$exe" --path "$data" --version > smoke/version.txt 2>&1 || echo "--version exit $?" >> smoke/version.txt
-          cat smoke/version.txt
-          # Text as an argument (how the app passes it today) and as a UTF-8 file.
-          "$exe" --path "$data" -q -x --ipa -v vi "$text" > smoke/ipa-argv-x.txt || true
-          "$exe" --path "$data" -v vi --ipa -q -- "$text" > smoke/ipa-argv.txt || true
-          "$exe" --path "$data" -q -x --ipa -v vi -f in.txt > smoke/ipa-file-x.txt
-          "$exe" --path "$data" -v vi --ipa -q -f in.txt > smoke/ipa-file.txt
-          # Informational: the same exe over the macOS release's data archive.
-          "$exe" --path "$(cygpath -w "$probe-mac")" -v vi --ipa -q -f in.txt > smoke/ipa-file-macdata.txt || true
-          {
-            echo "### espeak-ng smoke (\`$text\`)"
-            for f in smoke/ipa-*.txt; do
-              echo "- $(basename "$f"): \`$(tr -d '\r\n' < "$f")\` (hex: $(tr -d '\r\n' < "$f" | od -An -tx1 | tr -d ' \n' | head -c 160))"
-            done
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-          grep -q 'ː' smoke/ipa-file.txt || { echo "no IPA from the shipped files"; exit 1; }
+          printf '%s' 'ma mà mả mã má' > in.txt
+          "$probe/bin/espeak-ng.exe" --path "$(cygpath -w "$probe")" -q -x --ipa -v vi -f in.txt | tee ipa.txt
+          grep -q 'ː' ipa.txt
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -154,14 +118,6 @@ jobs:
           name: win-vcrt
           path: vcrt/*
           if-no-files-found: error
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: smoke-espeak
-          path: |
-            smoke/*
-            data.diff
-            mac.sums
-            win.sums
 
   omnivoice:
     # windows-latest ships VS 2026 (MSVC 14.5x), which CUDA 12.9 does not support.
@@ -271,7 +227,7 @@ jobs:
           cp "$(cygpath -u "$CUDA_PATH")/LICENSE" cuda/LICENSE-cuda-redist.txt
           ls -l out cuda | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Smoke - --help, and backends with no CUDA on PATH
+      - name: Smoke - --help with no CUDA on PATH
         shell: bash
         run: |
           set -uo pipefail
@@ -284,10 +240,6 @@ jobs:
             echo "$exe --help exit $?"; head -5 "smoke/$exe-help.txt"
             grep -qi usage "smoke/$exe-help.txt" || { echo "$exe --help printed no usage"; exit 1; }
           done
-          # Informational: GGML_BACKEND=none makes backend init list the devices it loaded.
-          GGML_BACKEND=none "$probe/omnivoice-tts.exe" --model none.gguf --codec none.gguf -o none.wav \
-            < /dev/null > smoke/backends.txt 2>&1 || true
-          cat smoke/backends.txt
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -409,7 +361,7 @@ jobs:
         working-directory: assets
         run: |
           set -euo pipefail
-          sha256sum -- *-"$TRIPLE".* espeak-ng-data.tar > SHA256SUMS-windows
+          sha256sum -- *-"$TRIPLE".* > SHA256SUMS-windows
           cat SHA256SUMS-windows
           ls -l
 
@@ -428,9 +380,9 @@ jobs:
           {
             echo "x86_64-pc-windows-msvc dub sidecars, built by \`.github/workflows/windows.yml\` (run $GITHUB_RUN_ID)."
             echo
-            echo "Install each asset under its name minus \`-$TRIPLE\` (e.g. \`ggml-cuda-$TRIPLE.dll\` → \`ggml-cuda.dll\`), all in one directory; \`espeak-ng-data.tar\` unpacks into \`espeak-ng-data/\`."
+            echo "Install each asset under its name minus \`-$TRIPLE\` (e.g. \`ggml-cuda-$TRIPLE.dll\` → \`ggml-cuda.dll\`), all in one directory."
             echo
-            echo "- espeak-ng $ESPEAK_VERSION, repackaged from the official \`espeak-ng.msi\`."
+            echo "- espeak-ng $ESPEAK_VERSION, repackaged from the official \`espeak-ng.msi\`. No data archive here: use \`espeak-ng-data.tar\` from release \`dub-2026.10.10\`."
             echo "- \`msvcp140\`, \`vcruntime140\`, \`vcruntime140_1\`: Microsoft's Visual C++ runtime, redistributable app-local, needed by espeak-ng and omnivoice on a machine without the VC++ redistributable."
             echo "- omnivoice.cpp @ \`$OMNIVOICE_REV\`, CUDA $CUDA_VERSION + CPU, ggml backends loaded at runtime. The \`cu*64_*\` DLLs are NVIDIA's CUDA runtime, redistributed under \`LICENSE-cuda-redist\`; without them omnivoice runs on CPU."
             if [ "$SHERPA_BUILT" = "true" ]; then
