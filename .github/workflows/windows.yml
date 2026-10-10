@@ -101,14 +101,23 @@ jobs:
           fi
           ls -l out
 
+          # espeak-ng.exe and libespeak-ng.dll link the dynamic MSVC runtime, which a clean
+          # Windows does not carry; it is redistributable app-local (one copy beside the exes).
+          mkdir -p vcrt
+          crt="$(ls -d "$(cygpath -u "$VCToolsRedistDir")"/x64/Microsoft.VC14*.CRT | head -1)"
+          echo "MSVC runtime from $crt"
+          for d in msvcp140 vcruntime140 vcruntime140_1; do cp "$crt/$d.dll" "vcrt/$d-$TRIPLE.dll"; done
+          ls -l vcrt
+
       - name: Smoke - the shipped files phonemise Vietnamese
         shell: bash
         run: |
           set -euo pipefail
-          probe="$RUNNER_TEMP/probe"
-          mkdir -p "$probe/bin" "$probe/espeak-ng-data"
+          probe="$(cygpath -u "$RUNNER_TEMP")/probe"
+          mkdir -p "$probe/bin" "$probe/espeak-ng-data" "$probe-mac/espeak-ng-data"
           tar -C "$probe/espeak-ng-data" -xf out/espeak-ng-data.tar
-          for f in out/*-"$TRIPLE".*; do
+          tar -C "$probe-mac/espeak-ng-data" -xf mac.tar
+          for f in out/*-"$TRIPLE".* vcrt/*-"$TRIPLE".*; do
             b="$(basename "$f")"; cp "$f" "$probe/bin/${b/-$TRIPLE/}"
           done
           ls -l "$probe/bin"
@@ -123,6 +132,8 @@ jobs:
           "$exe" --path "$data" -v vi --ipa -q -- "$text" > smoke/ipa-argv.txt || true
           "$exe" --path "$data" -q -x --ipa -v vi -f in.txt > smoke/ipa-file-x.txt
           "$exe" --path "$data" -v vi --ipa -q -f in.txt > smoke/ipa-file.txt
+          # Informational: the same exe over the macOS release's data archive.
+          "$exe" --path "$(cygpath -w "$probe-mac")" -v vi --ipa -q -f in.txt > smoke/ipa-file-macdata.txt || true
           {
             echo "### espeak-ng smoke (\`$text\`)"
             for f in smoke/ipa-*.txt; do
@@ -138,6 +149,11 @@ jobs:
           if-no-files-found: error
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          name: win-vcrt
+          path: vcrt/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
           name: smoke-espeak
           path: |
             smoke/*
@@ -146,7 +162,8 @@ jobs:
             win.sums
 
   omnivoice:
-    runs-on: windows-latest
+    # windows-latest ships VS 2026 (MSVC 14.5x), which CUDA 12.9 does not support.
+    runs-on: windows-2022
     timeout-minutes: 300
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -157,16 +174,42 @@ jobs:
           path: omnivoice
           persist-credentials: false
 
-      - uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
-        id: cuda
-        with:
-          cuda: ${{ env.CUDA_VERSION }}
-          method: network
-          sub-packages: '["nvcc","cudart","cublas","cublas_dev","crt","nvvm","thrust","visual_studio_integration"]'
-
       - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         with:
           arch: x64
+
+      # The CUDA toolkit from NVIDIA's redistributable archives, each pinned by the sha256
+      # in redistrib_12.9.1.json: only what ggml-cuda needs, no installer.
+      - name: CUDA 12.9.1 (nvcc, cudart, cublas, cccl)
+        shell: pwsh
+        run: |
+          $base = 'https://developer.download.nvidia.com/compute/cuda/redist'
+          $parts = @(
+            @('cuda_nvcc/windows-x86_64/cuda_nvcc-windows-x86_64-12.9.86-archive.zip', '227b109663b5e57d2718bcabb24a4ba0d9d4e52d958e327dc476f7c28691be85'),
+            @('cuda_cudart/windows-x86_64/cuda_cudart-windows-x86_64-12.9.79-archive.zip', '179e9c43b0735ffe67207b3da556eb5a0c50f3047961882b7657d3b822d34ef8'),
+            @('libcublas/windows-x86_64/libcublas-windows-x86_64-12.9.1.4-archive.zip', 'd534d98b0b453a98914dbf3adf47d7e84b55037abf02f87466439e1dcef581ed'),
+            @('cuda_cccl/windows-x86_64/cuda_cccl-windows-x86_64-12.9.27-archive.zip', '17aaa7c6b8f94a417d8f3261780b7e34b9cbdfab7513bce86768623b06aa28b5')
+          )
+          $root = Join-Path $env:RUNNER_TEMP 'cuda'
+          $x = Join-Path $env:RUNNER_TEMP 'cuda-x'
+          New-Item -ItemType Directory -Force $root, $x | Out-Null
+          foreach ($p in $parts) {
+            $zip = Join-Path $env:RUNNER_TEMP (Split-Path $p[0] -Leaf)
+            curl.exe -sSfL -o $zip "$base/$($p[0])"
+            if ($LASTEXITCODE -ne 0) { throw "download failed: $($p[0])" }
+            $h = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+            if ($h -ne $p[1]) { throw "sha256 mismatch for $($p[0]): $h" }
+            tar.exe -xf $zip -C $x
+            if ($LASTEXITCODE -ne 0) { throw "unzip failed: $zip" }
+            Remove-Item $zip
+          }
+          foreach ($d in Get-ChildItem $x -Directory) {
+            robocopy $d.FullName $root /E /MOVE /NFL /NDL /NJH /NJS | Out-Null
+            if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $($d.Name)" }
+          }
+          Get-ChildItem $root | ForEach-Object Name
+          "CUDA_PATH=$root" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "$root\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
 
       # Backends as DLLs (upstream buildall.cmd): ggml_backend_load_all() loads ggml-cuda.dll
       # only when the CUDA runtime DLLs resolve, so a machine without them still runs on CPU.
@@ -176,7 +219,7 @@ jobs:
           nvcc --version
           cmake -S omnivoice -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
             -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_NATIVE=OFF `
-            -DGGML_CUDA=ON "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH\bin\nvcc.exe" `
+            -DGGML_CUDA=ON "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH\bin\nvcc.exe" "-DCUDAToolkit_ROOT=$env:CUDA_PATH" `
             "-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler"
           if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
 
@@ -220,9 +263,9 @@ jobs:
           for d in $(echo "$want" | tr ' ' '\n' | sort -u); do
             cp "$cudabin/$d" "cuda/$(basename "$d" .dll)-$TRIPLE.dll"
           done
-          eula="$(find "$(cygpath -u "$CUDA_PATH")" -maxdepth 2 -iname 'EULA*' | head -1)"
-          if [ -n "$eula" ]; then cp "$eula" cuda/LICENSE-cuda-redist.txt
-          else curl -sSfL -o cuda/LICENSE-cuda-redist.html https://docs.nvidia.com/cuda/eula/index.html; fi
+          # Every redist archive carries NVIDIA's CUDA EULA as LICENSE (Attachment A lists the
+          # redistributable cudart and cublas DLLs).
+          cp "$(cygpath -u "$CUDA_PATH")/LICENSE" cuda/LICENSE-cuda-redist.txt
           ls -l out cuda | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Smoke - --help, and backends with no CUDA on PATH
@@ -385,6 +428,7 @@ jobs:
             echo "Install each asset under its name minus \`-$TRIPLE\` (e.g. \`ggml-cuda-$TRIPLE.dll\` → \`ggml-cuda.dll\`), all in one directory; \`espeak-ng-data.tar\` unpacks into \`espeak-ng-data/\`."
             echo
             echo "- espeak-ng $ESPEAK_VERSION, repackaged from the official \`espeak-ng.msi\`."
+            echo "- \`msvcp140\`, \`vcruntime140\`, \`vcruntime140_1\`: Microsoft's Visual C++ runtime, redistributable app-local, needed by espeak-ng and omnivoice on a machine without the VC++ redistributable."
             echo "- omnivoice.cpp @ \`$OMNIVOICE_REV\`, CUDA $CUDA_VERSION + CPU, ggml backends loaded at runtime. The \`cu*64_*\` DLLs are NVIDIA's CUDA runtime, redistributed under \`LICENSE-cuda-redist\`; without them omnivoice runs on CPU."
             if [ "$SHERPA_BUILT" = "true" ]; then
               echo "- vupr-dub-sherpa @ tts \`$TTS_REV\`, sherpa-onnx 1.13.8 linked statically."
