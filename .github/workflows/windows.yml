@@ -1,0 +1,397 @@
+name: windows
+
+# Builds the x86_64-pc-windows-msvc dub sidecars and publishes them as a NEW release.
+# Never re-uploads into an existing tag: the app pins every asset's sha256, so a rebuild
+# ships under a new tag and a catalogue edit.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create (must not exist yet), e.g. dub-win-2026.10.10"
+        required: true
+        default: dub-win-2026.10.10
+
+permissions:
+  contents: read
+
+env:
+  TRIPLE: x86_64-pc-windows-msvc
+  ESPEAK_VERSION: "1.52.0"
+  # espeak-ng tag 1.52.0
+  ESPEAK_REV: 4870adfa25b1a32b4361592f1be8a40337c58d6c
+  ESPEAK_MSI_SHA256: 7f673c709ea5dd579d3b5ebb98688cc575328a6ab7438d2bc405b88cedaeafb9
+  # The macOS release's data archive, compared against the MSI's data dir.
+  MAC_DATA_URL: https://github.com/tuananhiik/vupr-sidecars/releases/download/dub-2026.10.10/espeak-ng-data.tar
+  MAC_DATA_SHA256: b0fea3386ae569662a9d104e4b0878ee24d3cf489c136f40de78f53992d3c254
+  OMNIVOICE_REV: 4f33af825d66e6ef1cb185e87b4589cacf747291
+  CUDA_VERSION: "12.9.1"
+  TTS_REV: db6b3b106f1cb30ff5c69861f66bc122beb050b1
+  RUST_TOOLCHAIN: "1.98.0"
+  # sherpa-onnx tag v1.13.8
+  SHERPA_ONNX_REV: 11afbd009a7f8c08f4bcf2fc1b265d0df4670fbf
+
+jobs:
+  espeak:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+
+      - name: Fetch the official MSI
+        shell: bash
+        run: |
+          curl -sSfL -o espeak-ng.msi \
+            "https://github.com/espeak-ng/espeak-ng/releases/download/${ESPEAK_VERSION}/espeak-ng.msi"
+          echo "${ESPEAK_MSI_SHA256}  espeak-ng.msi" | sha256sum -c -
+
+      - name: Administrative install (extract only)
+        shell: pwsh
+        run: |
+          $dest = Join-Path $env:RUNNER_TEMP 'espeak-msi'
+          $msi = Join-Path $PWD 'espeak-ng.msi'
+          $p = Start-Process msiexec.exe -ArgumentList '/a', $msi, '/qn', "TARGETDIR=$dest" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "msiexec /a exited $($p.ExitCode)" }
+          Get-ChildItem -Recurse $dest -File |
+            Where-Object { $_.FullName -notmatch 'espeak-ng-data' } |
+            ForEach-Object { "{0,12} {1}" -f $_.Length, $_.FullName }
+          $exe = Get-ChildItem -Recurse $dest -Filter espeak-ng.exe | Select-Object -First 1
+          if (-not $exe) { throw 'espeak-ng.exe is not in the MSI' }
+          "ESPEAK_ROOT=$($exe.DirectoryName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          $deps = foreach ($f in @($exe) + @(Get-ChildItem $exe.DirectoryName -Filter *.dll)) {
+            "== $($f.Name)"; dumpbin /nologo /dependents $f.FullName | Select-String '\.dll' | ForEach-Object { $_.Line.Trim() }
+          }
+          $deps
+          "### espeak-ng dependencies`n``````" + "`n" + ($deps -join "`n") + "`n``````" |
+            Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+
+      - name: Package the CLI, its DLLs and the data archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="$(cygpath -u "$ESPEAK_ROOT")"
+          mkdir -p out
+          cp "$root/espeak-ng.exe" "out/espeak-ng-$TRIPLE.exe"
+          for dll in "$root"/*.dll; do
+            cp "$dll" "out/$(basename "$dll" .dll)-$TRIPLE.dll"
+          done
+          curl -sSfL -o "out/LICENSE-espeak-ng" \
+            "https://raw.githubusercontent.com/espeak-ng/espeak-ng/${ESPEAK_REV}/COPYING"
+
+          # Is the MSI's data dir the same content as the macOS archive?
+          curl -sSfL -o mac.tar "$MAC_DATA_URL"
+          echo "${MAC_DATA_SHA256}  mac.tar" | sha256sum -c -
+          mkdir -p mac && tar -C mac -xf mac.tar
+          win="$root/espeak-ng-data"
+          (cd mac && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum) > mac.sums
+          (cd "$win" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum) > win.sums
+          echo "mac files: $(wc -l < mac.sums), windows files: $(wc -l < win.sums)"
+          if diff mac.sums win.sums > data.diff; then
+            echo "DATA: the MSI's espeak-ng-data is byte-identical, file for file, to the macOS archive" | tee -a "$GITHUB_STEP_SUMMARY"
+            cp mac.tar out/espeak-ng-data.tar
+          else
+            echo "DATA: the MSI's espeak-ng-data DIFFERS from the macOS archive ($(grep -c '^[<>]' data.diff) lines differ)" | tee -a "$GITHUB_STEP_SUMMARY"
+            head -40 data.diff
+            (cd "$win" && find . -type f | LC_ALL=C sort | sed 's|^\./||') > files
+            tar -C "$win" --format=ustar --owner=0 --group=0 --numeric-owner \
+              --mtime='2000-01-01 00:00:00Z' --mode='u+rw,go+r' \
+              -cf out/espeak-ng-data.tar -T files
+          fi
+          ls -l out
+
+      - name: Smoke - the shipped files phonemise Vietnamese
+        shell: bash
+        run: |
+          set -euo pipefail
+          probe="$RUNNER_TEMP/probe"
+          mkdir -p "$probe/bin" "$probe/espeak-ng-data"
+          tar -C "$probe/espeak-ng-data" -xf out/espeak-ng-data.tar
+          for f in out/*-"$TRIPLE".*; do
+            b="$(basename "$f")"; cp "$f" "$probe/bin/${b/-$TRIPLE/}"
+          done
+          ls -l "$probe/bin"
+          data="$(cygpath -w "$probe")"
+          exe="$probe/bin/espeak-ng.exe"
+          text='ma mà mả mã má'
+          printf '%s' "$text" > in.txt
+          mkdir -p smoke
+          "$exe" --version | tee smoke/version.txt
+          # Text as an argument (how the app passes it today) and as a UTF-8 file.
+          "$exe" --path "$data" -q -x --ipa -v vi "$text" > smoke/ipa-argv-x.txt || true
+          "$exe" --path "$data" -v vi --ipa -q -- "$text" > smoke/ipa-argv.txt || true
+          "$exe" --path "$data" -q -x --ipa -v vi -f in.txt > smoke/ipa-file-x.txt
+          "$exe" --path "$data" -v vi --ipa -q -f in.txt > smoke/ipa-file.txt
+          {
+            echo "### espeak-ng smoke (\`$text\`)"
+            for f in smoke/ipa-*.txt; do
+              echo "- $(basename "$f"): \`$(tr -d '\r\n' < "$f")\` (hex: $(tr -d '\r\n' < "$f" | od -An -tx1 | tr -d ' \n' | head -c 160))"
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -q 'ː' smoke/ipa-file.txt || { echo "no IPA from the shipped files"; exit 1; }
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: win-espeak
+          path: out/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: smoke-espeak
+          path: |
+            smoke/*
+            data.diff
+            mac.sums
+            win.sums
+
+  omnivoice:
+    runs-on: windows-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ServeurpersoCom/omnivoice.cpp
+          ref: ${{ env.OMNIVOICE_REV }}
+          submodules: recursive
+          path: omnivoice
+          persist-credentials: false
+
+      - uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d # v0.2.36
+        id: cuda
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          method: network
+          sub-packages: '["nvcc","cudart","cublas","cublas_dev","crt","nvvm","thrust","visual_studio_integration"]'
+
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+
+      # Backends as DLLs (upstream buildall.cmd): ggml_backend_load_all() loads ggml-cuda.dll
+      # only when the CUDA runtime DLLs resolve, so a machine without them still runs on CPU.
+      - name: Configure (CUDA + CPU, backends loaded at runtime)
+        shell: pwsh
+        run: |
+          nvcc --version
+          cmake -S omnivoice -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_NATIVE=OFF `
+            -DGGML_CUDA=ON "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH\bin\nvcc.exe" `
+            "-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler"
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
+          if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
+
+      - name: Dependencies of every shipped binary
+        shell: pwsh
+        run: |
+          $files = @(Get-Item build\omnivoice-tts.exe, build\omnivoice-codec.exe) + @(Get-ChildItem build -Filter *.dll)
+          $deps = foreach ($f in $files) {
+            "== $($f.Name) ($($f.Length) bytes)"
+            dumpbin /nologo /dependents $f.FullName | Select-String '\.dll' | ForEach-Object { $_.Line.Trim() }
+          }
+          $deps | Tee-Object -FilePath deps.txt
+          "### omnivoice dependencies`n``````" + "`n" + ($deps -join "`n") + "`n``````" |
+            Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          $cuda = dumpbin /nologo /dependents build\ggml-cuda.dll | Select-String '^\s*(cu\S+\.dll)' |
+            ForEach-Object { $_.Matches[0].Groups[1].Value }
+          if (-not $cuda) { throw 'ggml-cuda.dll names no CUDA runtime DLL' }
+          ($cuda -join ' ') | Out-File -Encoding ascii cuda-dlls.txt
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out cuda
+          for exe in omnivoice-tts omnivoice-codec; do cp "build/$exe.exe" "out/$exe-$TRIPLE.exe"; done
+          for dll in build/*.dll; do cp "$dll" "out/$(basename "$dll" .dll)-$TRIPLE.dll"; done
+          cp omnivoice/LICENSE out/LICENSE-omnivoice.cpp
+          cudabin="$(cygpath -u "$CUDA_PATH")/bin"
+          # cublasLt is loaded by cublas, not named by ggml-cuda.dll: follow one level.
+          want="$(tr -d '\r' < cuda-dlls.txt)"
+          for d in $want; do
+            extra="$(MSYS_NO_PATHCONV=1 dumpbin /nologo /dependents "$(cygpath -w "$cudabin/$d")" | grep -oE 'cu[A-Za-z]+64_[0-9]+\.dll' || true)"
+            want="$want $extra"
+          done
+          for d in $(echo "$want" | tr ' ' '\n' | sort -u); do
+            cp "$cudabin/$d" "cuda/$(basename "$d" .dll)-$TRIPLE.dll"
+          done
+          eula="$(find "$(cygpath -u "$CUDA_PATH")" -maxdepth 2 -iname 'EULA*' | head -1)"
+          if [ -n "$eula" ]; then cp "$eula" cuda/LICENSE-cuda-redist.txt
+          else curl -sSfL -o cuda/LICENSE-cuda-redist.html https://docs.nvidia.com/cuda/eula/index.html; fi
+          ls -l out cuda | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Smoke - --help, and backends with no CUDA on PATH
+        shell: bash
+        run: |
+          set -uo pipefail
+          probe="$RUNNER_TEMP/ov"
+          mkdir -p "$probe" smoke
+          for f in out/*-"$TRIPLE".*; do b="$(basename "$f")"; cp "$f" "$probe/${b/-$TRIPLE/}"; done
+          PATH="$(echo "$PATH" | tr ':' '\n' | grep -vi cuda | paste -sd: -)"
+          for exe in omnivoice-tts omnivoice-codec; do
+            "$probe/$exe.exe" --help > "smoke/$exe-help.txt" 2>&1
+            echo "$exe --help exit $?"; head -5 "smoke/$exe-help.txt"
+            grep -qi usage "smoke/$exe-help.txt" || { echo "$exe --help printed no usage"; exit 1; }
+          done
+          # Informational: GGML_BACKEND=none makes backend init list the devices it loaded.
+          GGML_BACKEND=none "$probe/omnivoice-tts.exe" --model none.gguf --codec none.gguf -o none.wav \
+            < /dev/null > smoke/backends.txt 2>&1 || true
+          cat smoke/backends.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: win-omnivoice
+          path: out/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: win-cuda-redist
+          path: cuda/*
+          if-no-files-found: error
+          compression-level: 1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: smoke-omnivoice
+          path: |
+            smoke/*
+            deps.txt
+
+  sherpa:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    outputs:
+      built: ${{ steps.gate.outputs.built }}
+    env:
+      TTS_READ_TOKEN: ${{ secrets.TTS_READ_TOKEN }}
+    steps:
+      - name: Gate on secrets.TTS_READ_TOKEN
+        id: gate
+        shell: bash
+        run: |
+          if [ -z "$TTS_READ_TOKEN" ]; then
+            echo "::notice title=vupr-dub-sherpa skipped::secrets.TTS_READ_TOKEN is not set, so the private tuananhiik/tts source cannot be read. The release carries espeak-ng and omnivoice only."
+            echo "built=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "built=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.gate.outputs.built == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: tuananhiik/tts
+          ref: ${{ env.TTS_REV }}
+          token: ${{ secrets.TTS_READ_TOKEN }}
+          path: tts
+          persist-credentials: false
+
+      # sherpa-onnx-sys 1.13.8 links the static win-x64 "MT" archive (static CRT), so Rust
+      # must link the static CRT too or the link fails on a /MT vs /MD mismatch.
+      - if: steps.gate.outputs.built == 'true'
+        name: Build
+        shell: bash
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "$TRIPLE"
+          cargo "+$RUST_TOOLCHAIN" build --release --locked --target "$TRIPLE" \
+            --manifest-path tts/Cargo.toml -p vupr-dub-sherpa
+
+      - if: steps.gate.outputs.built == 'true'
+        name: Package, dependencies and licences
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp "tts/target/$TRIPLE/release/vupr-dub-sherpa.exe" "out/vupr-dub-sherpa-$TRIPLE.exe"
+          curl -sSfL -o out/LICENSE-sherpa-onnx \
+            "https://raw.githubusercontent.com/k2-fsa/sherpa-onnx/${SHERPA_ONNX_REV}/LICENSE"
+          ls -l out
+
+      - if: steps.gate.outputs.built == 'true'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+
+      - if: steps.gate.outputs.built == 'true'
+        name: Dependencies
+        shell: pwsh
+        run: |
+          $lines = dumpbin /nologo /dependents "out\vupr-dub-sherpa-$env:TRIPLE.exe" | Select-String '\.dll' | ForEach-Object { $_.Line.Trim() }
+          $lines
+          "### vupr-dub-sherpa dependencies`n``````" + "`n" + ($lines -join "`n") + "`n``````" |
+            Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+
+      - if: steps.gate.outputs.built == 'true'
+        name: Smoke - health over envelope v1
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p smoke
+          printf '%s\n' '{"v":1,"id":"h-1","op":"health","params":{}}' \
+            | "out/vupr-dub-sherpa-$TRIPLE.exe" > smoke/health.out 2> smoke/health.err
+          cat smoke/health.out
+          tail -5 smoke/health.err || true
+          echo "### vupr-dub-sherpa health: \`$(tr -d '\r\n' < smoke/health.out)\`" >> "$GITHUB_STEP_SUMMARY"
+          grep -q '"id":"h-1"' smoke/health.out && grep -q '"ok":true' smoke/health.out
+
+      - if: steps.gate.outputs.built == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: win-sherpa
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    needs: [espeak, omnivoice, sherpa]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: win-*
+          path: assets
+          merge-multiple: true
+
+      - name: SHA256SUMS-windows
+        working-directory: assets
+        run: |
+          set -euo pipefail
+          sha256sum -- *-"$TRIPLE".* espeak-ng-data.tar > SHA256SUMS-windows
+          cat SHA256SUMS-windows
+          ls -l
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          SHERPA_BUILT: ${{ needs.sherpa.outputs.built }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad tag: $TAG"; exit 1; }
+          [ "$TAG" != "dub-2026.10.10" ] || { echo "refusing to touch the macOS release"; exit 1; }
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "release $TAG already exists: a rebuild ships under a new tag"; exit 1
+          fi
+          {
+            echo "x86_64-pc-windows-msvc dub sidecars, built by \`.github/workflows/windows.yml\` (run $GITHUB_RUN_ID)."
+            echo
+            echo "Install each asset under its name minus \`-$TRIPLE\` (e.g. \`ggml-cuda-$TRIPLE.dll\` → \`ggml-cuda.dll\`), all in one directory; \`espeak-ng-data.tar\` unpacks into \`espeak-ng-data/\`."
+            echo
+            echo "- espeak-ng $ESPEAK_VERSION, repackaged from the official \`espeak-ng.msi\`."
+            echo "- omnivoice.cpp @ \`$OMNIVOICE_REV\`, CUDA $CUDA_VERSION + CPU, ggml backends loaded at runtime. The \`cu*64_*\` DLLs are NVIDIA's CUDA runtime, redistributed under \`LICENSE-cuda-redist\`; without them omnivoice runs on CPU."
+            if [ "$SHERPA_BUILT" = "true" ]; then
+              echo "- vupr-dub-sherpa @ tts \`$TTS_REV\`, sherpa-onnx 1.13.8 linked statically."
+            else
+              echo "- vupr-dub-sherpa: **not in this release** (the run had no \`TTS_READ_TOKEN\`)."
+            fi
+          } > notes.md
+          cat notes.md
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$TAG" --notes-file notes.md assets/*
