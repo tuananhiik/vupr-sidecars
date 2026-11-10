@@ -73,9 +73,9 @@ jobs:
           dll="$(find i-shared -iname '*espeak-ng*.dll' | head -1)"
           [ -n "$dll" ] || { echo "no espeak-ng DLL in the shared install"; exit 1; }
           cp "$dll" "out/libespeak-ng-$TRIPLE.dll"
-          dumpbin /nologo /exports "out/libespeak-ng-$TRIPLE.dll" | tee exports.txt
+          dumpbin -nologo -exports "out/libespeak-ng-$TRIPLE.dll" | tee exports.txt
           grep -q 'espeak_TextToPhonemesWithTerminator' exports.txt
-          for f in out/*.exe out/*.dll; do echo "== $f"; dumpbin /nologo /dependents "$f" | grep -i '\.dll'; done
+          for f in out/*.exe out/*.dll; do echo "== $f"; dumpbin -nologo -dependents "$f" | grep -i '\.dll'; done
           curl -sSfL -o "out/LICENSE-espeak-ng" \
             "https://raw.githubusercontent.com/espeak-ng/espeak-ng/${ESPEAK_REV}/COPYING"
           crt="$(ls -d "$(cygpath -u "$VCToolsRedistDir")"/x64/Microsoft.VC14*.CRT | head -1)"
