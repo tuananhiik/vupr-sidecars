@@ -1,0 +1,140 @@
+name: espeak-windows
+
+# Builds espeak-ng for x86_64-pc-windows-msvc from source at the commit piper1-gpl pins and
+# publishes it as a NEW release. Never re-uploads into an existing tag: the app pins every
+# asset's sha256, so a rebuild ships under a new tag and a catalogue edit.
+#
+# Why source and not the 1.52.0 MSI: 1.52.0 does not export
+# espeak_TextToPhonemesWithTerminator, which the app's Piper engine phonemises through.
+# The data archive is not built here: the app uses the macOS espeak release's
+# espeak-ng-data.tar on every platform, built from the same commit.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create (must not exist yet), e.g. espeak-win-2026.11.10"
+        required: true
+      data_tag:
+        description: "The macOS espeak release whose espeak-ng-data.tar the smoke reads"
+        required: true
+      data_sha256:
+        description: "sha256 of that espeak-ng-data.tar"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  TRIPLE: x86_64-pc-windows-msvc
+  # espeak-ng master, 2025-03-22 (piper1-gpl CMakeLists.txt)
+  ESPEAK_REV: 212928b394a96e8fd2096616bfd54e17845c48f6
+
+jobs:
+  espeak:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: espeak-ng/espeak-ng
+          ref: ${{ env.ESPEAK_REV }}
+          path: espeak-ng
+          persist-credentials: false
+
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+
+      # Static for the CLI (one exe, as before); shared for the DLL the app loads in-process.
+      - name: Build static and shared
+        shell: bash
+        run: |
+          set -euo pipefail
+          src="$PWD/espeak-ng"
+          for kind in static shared; do
+            shared=OFF; [ "$kind" = shared ] && shared=ON
+            cmake -S "$src" -B "b-$kind" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+              -DBUILD_SHARED_LIBS=$shared -DCMAKE_INSTALL_PREFIX="$PWD/i-$kind" \
+              -DUSE_ASYNC=OFF -DUSE_MBROLA=OFF -DUSE_LIBSONIC=OFF -DUSE_LIBPCAUDIO=OFF \
+              -DUSE_KLATT=OFF -DUSE_SPEECHPLAYER=OFF -DEXTRA_cmn=ON -DEXTRA_ru=ON \
+              "-DCMAKE_C_FLAGS=-D_FILE_OFFSET_BITS=64 -I$src/src/ucd-tools/src/include"
+            cmake --build "b-$kind"
+            cmake --install "b-$kind"
+          done
+          find i-static i-shared -maxdepth 2 -type f \( -name '*.exe' -o -name '*.dll' \) -print
+
+      - name: Package the CLI, the DLL and the MSVC runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out vcrt
+          cp "$(find i-static -name espeak-ng.exe | head -1)" "out/espeak-ng-$TRIPLE.exe"
+          dll="$(find i-shared -iname '*espeak-ng*.dll' | head -1)"
+          [ -n "$dll" ] || { echo "no espeak-ng DLL in the shared install"; exit 1; }
+          cp "$dll" "out/libespeak-ng-$TRIPLE.dll"
+          dumpbin /nologo /exports "out/libespeak-ng-$TRIPLE.dll" | tee exports.txt
+          grep -q 'espeak_TextToPhonemesWithTerminator' exports.txt
+          for f in out/*.exe out/*.dll; do echo "== $f"; dumpbin /nologo /dependents "$f" | grep -i '\.dll'; done
+          curl -sSfL -o "out/LICENSE-espeak-ng" \
+            "https://raw.githubusercontent.com/espeak-ng/espeak-ng/${ESPEAK_REV}/COPYING"
+          crt="$(ls -d "$(cygpath -u "$VCToolsRedistDir")"/x64/Microsoft.VC14*.CRT | head -1)"
+          for d in msvcp140 vcruntime140 vcruntime140_1; do cp "$crt/$d.dll" "vcrt/$d-$TRIPLE.dll"; done
+          ls -l out vcrt
+
+      - name: Smoke - the shipped exe over the pinned data phonemises Vietnamese
+        shell: bash
+        env:
+          DATA_URL: https://github.com/${{ github.repository }}/releases/download/${{ inputs.data_tag }}/espeak-ng-data.tar
+          DATA_SHA256: ${{ inputs.data_sha256 }}
+        run: |
+          set -euo pipefail
+          curl -sSfL -o data.tar "$DATA_URL"
+          echo "${DATA_SHA256}  data.tar" | sha256sum -c -
+          probe="$(cygpath -u "$RUNNER_TEMP")/probe"
+          mkdir -p "$probe/bin" "$probe/espeak-ng-data"
+          tar -C "$probe/espeak-ng-data" -xf data.tar
+          for f in out/*-"$TRIPLE".* vcrt/*-"$TRIPLE".*; do
+            b="$(basename "$f")"; cp "$f" "$probe/bin/${b/-$TRIPLE/}"
+          done
+          printf '%s' 'ma mà mả mã má' > in.txt
+          "$probe/bin/espeak-ng.exe" --path "$(cygpath -w "$probe")" -q --ipa -v vi -f in.txt | tee ipa.txt
+          grep -q 'ː' ipa.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: win-espeak
+          path: |
+            out/*
+            vcrt/*
+          if-no-files-found: error
+
+  release:
+    needs: [espeak]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: win-espeak
+          path: assets
+      - name: Publish a new release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad tag: $TAG"; exit 1; }
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "release $TAG already exists; a rebuild needs a new tag"; exit 1
+          fi
+          cd assets
+          find . -type f | sort
+          sha256sum -- $(find . -type f -name "*-x86_64-pc-windows-msvc*" | sort) > SHA256SUMS-windows
+          cat SHA256SUMS-windows
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "espeak-ng ${ESPEAK_REV:0:7} (Windows x64)" \
+            --notes "espeak-ng ${{ env.ESPEAK_REV }} built from source (static CLI, shared DLL, MSVC runtime). Data: ${{ inputs.data_tag }}." \
+            $(find . -type f | sort)
